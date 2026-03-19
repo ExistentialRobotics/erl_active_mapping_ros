@@ -72,11 +72,21 @@ def generate_launch_description():
                 output="screen",
                 parameters=[
                     {
-                        "default_qos_reliability": "reliable",
-                        "default_qos_durability": "transient_local",
                         "robot_frame": "laser",
                         "auto_replan": True,
                         "stop_exploration_ratio": 0.95,
+                        "path_topic.path": "path",
+                        "path_topic.qos_reliability": "reliable",
+                        "path_topic.qos_durability": "transient_local",
+                        "dist_topic.qos_reliability": "reliable",
+                        "dist_topic.qos_durability": "transient_local",
+                        "observed_area_topic.qos_reliability": "reliable",
+                        "observed_area_topic.qos_durability": "transient_local",
+                        "observed_ratio_topic.qos_reliability": "reliable",
+                        "observed_ratio_topic.qos_durability": "transient_local",
+                        "replan_topic.qos_reliability": "reliable",
+                        "replan_topic.qos_durability": "transient_local",
+                        "max_observed_area": 118.0,
                         "agent_config_file": PathJoinSubstitution(
                             [
                                 FindPackageShare("erl_active_mapping"),
@@ -88,9 +98,11 @@ def generate_launch_description():
                         "map_max": [12.0, 12.0],
                         "map_resolution": 0.05,
                         "use_external_map": False,
-                        "scan_topic": "scan",
-                        "path_topic": "path",
-                        "max_observed_area": 118.0,
+                        "scan_topic.path": "scan",
+                        "scan_topic.qos_reliability": "reliable",
+                        "scan_topic.qos_durability": "transient_local",
+                        "internal_map_topic.qos_reliability": "reliable",
+                        "internal_map_topic.qos_durability": "transient_local",
                     }
                 ],
             ),

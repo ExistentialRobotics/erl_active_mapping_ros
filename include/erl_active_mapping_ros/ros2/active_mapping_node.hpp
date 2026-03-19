@@ -1,3 +1,8 @@
+#pragma once
+
+#include "erl_common/ros2_topic_params.hpp"
+#include "erl_common/yaml.hpp"
+
 #include <Eigen/Dense>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -12,6 +17,82 @@
 
 #include <memory>
 
+inline rclcpp::Node *g_active_mapping_node = nullptr;
+
+struct ActiveMappingNodeConfig : public erl::common::Yamlable<ActiveMappingNodeConfig> {
+    using Ros2TopicParams = erl::common::ros_params::Ros2TopicParams;
+    std::string global_frame = "map";
+    std::string robot_frame = "base_link";
+    bool auto_replan = false;
+    double stop_exploration_ratio = 0.95;
+    Ros2TopicParams path_topic{"path"};
+    Ros2TopicParams dist_topic{"distance"};
+    Ros2TopicParams observed_area_topic{"observed_area"};
+    Ros2TopicParams observed_ratio_topic{"observed_ratio"};
+    Ros2TopicParams replan_topic{"replan"};
+    Ros2TopicParams plan_srv{"plan_path", "services"};
+    double max_observed_area = 10.0;
+
+    ERL_REFLECT_SCHEMA(
+        ActiveMappingNodeConfig,
+        ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, global_frame),
+        ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, robot_frame),
+        ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, auto_replan),
+        ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, stop_exploration_ratio),
+        ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, path_topic),
+        ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, dist_topic),
+        ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, observed_area_topic),
+        ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, observed_ratio_topic),
+        ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, replan_topic),
+        ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, plan_srv),
+        ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, max_observed_area));
+
+    bool
+    PostDeserialization() override {
+        auto logger = g_active_mapping_node->get_logger();
+        if (global_frame.empty()) {
+            RCLCPP_WARN(logger, "global_frame is empty");
+            return false;
+        }
+        if (robot_frame.empty()) {
+            RCLCPP_WARN(logger, "robot_frame is empty");
+            return false;
+        }
+        if (stop_exploration_ratio <= 0.0 || stop_exploration_ratio > 1.0) {
+            RCLCPP_WARN(
+                logger,
+                "stop_exploration_ratio must be in (0, 1], got %f",
+                stop_exploration_ratio);
+            return false;
+        }
+        if (max_observed_area <= 0.0) {
+            RCLCPP_WARN(logger, "max_observed_area must be positive, got %f", max_observed_area);
+            return false;
+        }
+        if (path_topic.path.empty()) {
+            RCLCPP_WARN(logger, "path_topic.path is empty");
+            return false;
+        }
+        if (dist_topic.path.empty()) {
+            RCLCPP_WARN(logger, "dist_topic.path is empty");
+            return false;
+        }
+        if (observed_area_topic.path.empty()) {
+            RCLCPP_WARN(logger, "observed_area_topic.path is empty");
+            return false;
+        }
+        if (observed_ratio_topic.path.empty()) {
+            RCLCPP_WARN(logger, "observed_ratio_topic.path is empty");
+            return false;
+        }
+        if (replan_topic.path.empty()) {
+            RCLCPP_WARN(logger, "replan_topic.path is empty");
+            return false;
+        }
+        return true;
+    }
+};
+
 template<typename Agent, typename Dtype, int Dim>
 class ActiveMappingNode : public rclcpp::Node {
 public:
@@ -21,37 +102,7 @@ public:
     using Observation = typename Agent::Observation_t;
 
 protected:
-    std::string m_global_frame_ = "map";
-    std::string m_robot_frame_ = "base_link";
-    bool m_auto_replan_ = false;
-    double m_stop_exploration_ratio_ = 0.95;
-
-    std::string m_default_qos_reliability_ = "reliable";
-    std::string m_default_qos_durability_ = "volatile";
-
-    std::string m_path_topic_ = "path";
-    std::string m_path_topic_reliability_ = m_default_qos_reliability_;
-    std::string m_path_topic_durability_ = m_default_qos_durability_;
-
-    std::string m_dist_topic_ = "distance";
-    std::string m_dist_topic_reliability_ = m_default_qos_reliability_;
-    std::string m_dist_topic_durability_ = m_default_qos_durability_;
-
-    std::string m_observed_area_topic_ = "observed_area";
-    std::string m_observed_area_topic_reliability_ = m_default_qos_reliability_;
-    std::string m_observed_area_topic_durability_ = m_default_qos_durability_;
-
-    std::string m_observed_ratio_topic_ = "observed_ratio";
-    std::string m_observed_ratio_topic_reliability_ = m_default_qos_reliability_;
-    std::string m_observed_ratio_topic_durability_ = m_default_qos_durability_;
-
-    std::string m_replan_topic_ = "replan";
-    std::string m_replan_topic_reliability_ = m_default_qos_reliability_;
-    std::string m_replan_topic_durability_ = m_default_qos_durability_;
-
-    std::string m_plan_srv_name_ = "plan_path";
-
-    double m_max_observed_area_ = 10.0;
+    ActiveMappingNodeConfig m_config_;
 
     std::shared_ptr<rclcpp::ParameterEventHandler> m_param_event_handler_;
     rclcpp::ParameterEventCallbackHandle::SharedPtr m_param_event_cb_handle_;
@@ -84,123 +135,18 @@ public:
           m_tf_buffer_(std::make_shared<tf2_ros::Buffer>(this->get_clock())),
           m_tf_listener_(std::make_shared<tf2_ros::TransformListener>(*m_tf_buffer_)) {
 
-        this->declare_parameter("default_qos_reliability", m_default_qos_reliability_);
-        this->declare_parameter("default_qos_durability", m_default_qos_durability_);
-        this->get_parameter("default_qos_reliability", m_default_qos_reliability_);
-        this->get_parameter("default_qos_durability", m_default_qos_durability_);
+        g_active_mapping_node = this;
 
-        this->declare_parameter("global_frame", m_global_frame_);
-        this->declare_parameter("robot_frame", m_robot_frame_);
-        this->declare_parameter("auto_replan", m_auto_replan_);
-        this->declare_parameter("stop_exploration_ratio", m_stop_exploration_ratio_);
-
-        this->declare_parameter("path_topic", m_path_topic_);
-        this->declare_parameter("path_topic_reliability", m_default_qos_reliability_);
-        this->declare_parameter("path_topic_durability", m_default_qos_durability_);
-
-        this->declare_parameter("dist_topic", m_dist_topic_);
-        this->declare_parameter("dist_topic_reliability", m_default_qos_reliability_);
-        this->declare_parameter("dist_topic_durability", m_default_qos_durability_);
-
-        this->declare_parameter("observed_area_topic", m_observed_area_topic_);
-        this->declare_parameter("observed_area_topic_reliability", m_default_qos_reliability_);
-        this->declare_parameter("observed_area_topic_durability", m_default_qos_durability_);
-
-        this->declare_parameter("observed_ratio_topic", m_observed_ratio_topic_);
-        this->declare_parameter("observed_ratio_topic_reliability", m_default_qos_reliability_);
-        this->declare_parameter("observed_ratio_topic_durability", m_default_qos_durability_);
-
-        this->declare_parameter("replan_topic", m_replan_topic_);
-        this->declare_parameter("replan_topic_reliability", m_default_qos_reliability_);
-        this->declare_parameter("replan_topic_durability", m_default_qos_durability_);
-
-        this->declare_parameter("max_observed_area", m_max_observed_area_);
-
-        // Get parameters
-#define GET_PARAM(param_name, member)                           \
-    if (!this->get_parameter(param_name, member)) {             \
-        RCLCPP_WARN(                                            \
-            this->get_logger(),                                 \
-            "Failed to get parameter %s, using default value.", \
-            param_name);                                        \
-    }                                                           \
-    (void) 0
-
-        GET_PARAM("global_frame", m_global_frame_);
-        GET_PARAM("robot_frame", m_robot_frame_);
-        GET_PARAM("auto_replan", m_auto_replan_);
-        GET_PARAM("stop_exploration_ratio", m_stop_exploration_ratio_);
-
-        GET_PARAM("path_topic", m_path_topic_);
-        GET_PARAM("path_topic_reliability", m_path_topic_reliability_);
-        GET_PARAM("path_topic_durability", m_path_topic_durability_);
-
-        GET_PARAM("dist_topic", m_dist_topic_);
-        GET_PARAM("dist_topic_reliability", m_dist_topic_reliability_);
-        GET_PARAM("dist_topic_durability", m_dist_topic_durability_);
-
-        GET_PARAM("observed_area_topic", m_observed_area_topic_);
-        GET_PARAM("observed_area_topic_reliability", m_observed_area_topic_reliability_);
-        GET_PARAM("observed_area_topic_durability", m_observed_area_topic_durability_);
-
-        GET_PARAM("observed_ratio_topic", m_observed_ratio_topic_);
-        GET_PARAM("observed_ratio_topic_reliability", m_observed_ratio_topic_reliability_);
-        GET_PARAM("observed_ratio_topic_durability", m_observed_ratio_topic_durability_);
-
-        GET_PARAM("replan_topic", m_replan_topic_);
-        GET_PARAM("replan_topic_reliability", m_replan_topic_reliability_);
-        GET_PARAM("replan_topic_durability", m_replan_topic_durability_);
-
-        GET_PARAM("max_observed_area", m_max_observed_area_);
-#undef GET_PARAM
+        if (!m_config_.LoadFromRos2(this, "")) {
+            RCLCPP_FATAL(this->get_logger(), "Failed to load ActiveMappingNodeConfig parameters");
+            rclcpp::shutdown();
+            return;
+        }
 
         RCLCPP_INFO(
             this->get_logger(),
-            "Parameters:\n"
-            "global_frame: %s\n"
-            "robot_frame: %s\n"
-            "auto_replan: %s\n"
-            "stop_exploration_ratio: %f\n"
-            "default_qos_reliability: %s\n"
-            "default_qos_durability: %s\n"
-            "path_topic: %s\n"
-            "path_topic_reliability: %s\n"
-            "path_topic_durability: %s\n"
-            "dist_topic: %s\n"
-            "dist_topic_reliability: %s\n"
-            "dist_topic_durability: %s\n"
-            "observed_area_topic: %s\n"
-            "observed_area_topic_reliability: %s\n"
-            "observed_area_topic_durability: %s\n"
-            "observed_ratio_topic: %s\n"
-            "observed_ratio_topic_reliability: %s\n"
-            "observed_ratio_topic_durability: %s\n"
-            "replan_topic: %s\n"
-            "replan_topic_reliability: %s\n"
-            "replan_topic_durability: %s\n"
-            "max_observed_area: %f",
-            m_global_frame_.c_str(),
-            m_robot_frame_.c_str(),
-            m_auto_replan_ ? "true" : "false",
-            m_stop_exploration_ratio_,
-            m_default_qos_reliability_.c_str(),
-            m_default_qos_durability_.c_str(),
-            m_path_topic_.c_str(),
-            m_path_topic_reliability_.c_str(),
-            m_path_topic_durability_.c_str(),
-            m_dist_topic_.c_str(),
-            m_dist_topic_reliability_.c_str(),
-            m_dist_topic_durability_.c_str(),
-            m_observed_area_topic_.c_str(),
-            m_observed_area_topic_reliability_.c_str(),
-            m_observed_area_topic_durability_.c_str(),
-            m_observed_ratio_topic_.c_str(),
-            m_observed_ratio_topic_reliability_.c_str(),
-            m_observed_ratio_topic_durability_.c_str(),
-            m_replan_topic_.c_str(),
-            m_replan_topic_reliability_.c_str(),
-            m_replan_topic_durability_.c_str(),
-            m_max_observed_area_);
+            "Loaded ActiveMappingNodeConfig:\n%s",
+            m_config_.AsYamlString().c_str());
 
         // Set parameter change callback
 #define SET_PARAM_IF(param, param_name, param_type, member)  \
@@ -231,31 +177,51 @@ public:
                         param,
                         "auto_replan",
                         rclcpp::ParameterType::PARAMETER_BOOL,
-                        m_auto_replan_);
+                        m_config_.auto_replan);
                     SET_PARAM_IF(
                         param,
                         "max_observed_area",
                         rclcpp::ParameterType::PARAMETER_DOUBLE,
-                        m_max_observed_area_);
+                        m_config_.max_observed_area);
                 }
             });
 #undef SET_PARAM_IF
 
         m_path_pub_ = this->create_publisher<nav_msgs::msg::Path>(
-            m_path_topic_,
-            GetQoS(m_path_topic_reliability_, m_path_topic_durability_));
+            m_config_.path_topic.path,
+            m_config_.path_topic.GetQoS());
         m_dist_pub_ = this->create_publisher<std_msgs::msg::Float64>(
-            m_dist_topic_,
-            GetQoS(m_dist_topic_reliability_, m_dist_topic_durability_));
+            m_config_.dist_topic.path,
+            m_config_.dist_topic.GetQoS());
         m_observed_area_pub_ = this->create_publisher<std_msgs::msg::Float64>(
-            m_observed_area_topic_,
-            GetQoS(m_observed_area_topic_reliability_, m_observed_area_topic_durability_));
+            m_config_.observed_area_topic.path,
+            m_config_.observed_area_topic.GetQoS());
         m_observed_ratio_pub_ = this->create_publisher<std_msgs::msg::Float64>(
-            m_observed_ratio_topic_,
-            GetQoS(m_observed_ratio_topic_reliability_, m_observed_ratio_topic_durability_));
+            m_config_.observed_ratio_topic.path,
+            m_config_.observed_ratio_topic.GetQoS());
         m_replan_pub_ = this->create_publisher<std_msgs::msg::Bool>(
-            m_replan_topic_,
-            GetQoS(m_replan_topic_reliability_, m_replan_topic_durability_));
+            m_config_.replan_topic.path,
+            m_config_.replan_topic.GetQoS());
+#ifdef ROS_HUMBLE
+        m_plan_srv_ = this->create_service<std_srvs::srv::Trigger>(
+            m_config_.plan_srv.path,
+            std::bind(
+                &ActiveMappingNode::CallbackSrvPlan,
+                this,
+                std::placeholders::_1,
+                std::placeholders::_2),
+            m_config_.plan_srv.GetQoS().get_rmw_qos_profile());
+#else
+        m_plan_srv_ = this->create_service<std_srvs::srv::Trigger>(
+            m_config_.plan_srv.path,
+            std::bind(
+                &ActiveMappingNode::CallbackSrvPlan,
+                this,
+                std::placeholders::_1,
+                std::placeholders::_2),
+            m_config_.plan_srv.GetQoS());
+#endif
+
     }
 
     virtual ~ActiveMappingNode() = default;
@@ -267,21 +233,21 @@ public:
         m_last_pose_ = cur_pose;
 
         m_observed_area_ = ComputeObservedArea();
-        m_ratio_ = m_observed_area_ / m_max_observed_area_;
+        m_ratio_ = m_observed_area_ / m_config_.max_observed_area;
         m_replan_ = m_agent_->ShouldReplan(cur_pose);
-        if (m_ratio_ >= m_stop_exploration_ratio_) {
+        if (m_ratio_ >= m_config_.stop_exploration_ratio) {
             RCLCPP_INFO(
                 this->get_logger(),
                 "Exploration completed (observed ratio: %.3f >= %.3f), stopping.",
                 m_ratio_,
-                m_stop_exploration_ratio_);
+                m_config_.stop_exploration_ratio);
             m_replan_ = false;
-            m_auto_replan_ = false;
+            m_config_.auto_replan = false;
         }
 
         PublishStats();
 
-        if (m_auto_replan_ && m_replan_) {
+        if (m_config_.auto_replan && m_replan_) {
             m_path_ = m_agent_->Plan(cur_pose);
             RCLCPP_INFO(
                 this->get_logger(),
@@ -375,7 +341,7 @@ public:
         }
         nav_msgs::msg::Path path_msg;
         path_msg.header.stamp = stamp;
-        path_msg.header.frame_id = m_global_frame_;
+        path_msg.header.frame_id = m_config_.global_frame;
         path_msg.poses.resize(m_path_.size());
         for (size_t i = 0; i < m_path_.size(); ++i) {
             const Pose &pose = m_path_[i];
@@ -403,11 +369,10 @@ public:
 
     bool
     GetPoseFromTf(const rclcpp::Time &time, geometry_msgs::msg::TransformStamped &pose) const {
-        // get the latest transform from the tf buffer
         try {
             pose = m_tf_buffer_->lookupTransform(
-                m_global_frame_,
-                m_robot_frame_,
+                m_config_.global_frame,
+                m_config_.robot_frame,
                 time,
                 rclcpp::Duration::from_seconds(5.0));
         } catch (tf2::TransformException &ex) {
@@ -415,33 +380,5 @@ public:
             return false;
         }
         return true;
-    }
-
-    rclcpp::QoS
-    GetQoS(const std::string &reliability, const std::string &durability) {
-        rclcpp::QoS qos(1);
-        if (reliability == "reliable") {
-            qos.reliable();
-        } else if (reliability == "best_effort") {
-            qos.best_effort();
-        } else {
-            RCLCPP_WARN(
-                this->get_logger(),
-                "Unknown reliability %s, using reliable.",
-                reliability.c_str());
-            qos.reliable();
-        }
-        if (durability == "volatile") {
-            qos.durability_volatile();
-        } else if (durability == "transient_local") {
-            qos.transient_local();
-        } else {
-            RCLCPP_WARN(
-                this->get_logger(),
-                "Unknown durability %s, using transient_local.",
-                durability.c_str());
-            qos.transient_local();
-        }
-        return qos;
     }
 };

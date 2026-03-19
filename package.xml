@@ -17,6 +17,7 @@
     <depend condition="$ROS_VERSION == 1">roscpp</depend>
     <depend condition="$ROS_VERSION == 1">rosgraph_msgs</depend>
     <depend condition="$ROS_VERSION == 1">geometry_msgs</depend>
+    <depend condition="$ROS_VERSION == 1">sensor_msgs</depend>
     <depend condition="$ROS_VERSION == 1">nav_msgs</depend>
     <depend condition="$ROS_VERSION == 1">std_srvs</depend>
     <depend condition="$ROS_VERSION == 1">tf2_ros</depend>
@@ -24,6 +25,7 @@
     <!-- ROS2 dependencies -->
     <depend condition="$ROS_VERSION == 2">rclcpp</depend>
     <depend condition="$ROS_VERSION == 2">geometry_msgs</depend>
+    <depend condition="$ROS_VERSION == 2">sensor_msgs</depend>
     <depend condition="$ROS_VERSION == 2">nav_msgs</depend>
     <depend condition="$ROS_VERSION == 2">std_srvs</depend>
     <depend condition="$ROS_VERSION == 2">tf2_ros</depend>

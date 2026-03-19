@@ -7,6 +7,76 @@
 template<typename Dtype>
 using Agent = erl::active_mapping::frontier_based::AgentFrontierBasedGrid2D<Dtype>;
 
+using namespace erl::common;
+using namespace erl::common::ros_params;
+
+struct FrontierBasedGrid2dNodeConfig : public Yamlable<FrontierBasedGrid2dNodeConfig> {
+    std::string agent_config_file;
+    std::vector<double> map_min = {-10.1, -10.1};
+    std::vector<double> map_max = {10.1, 10.1};
+    double map_resolution = 0.05;
+    bool use_external_map = false;
+    Ros2TopicParams map_topic{"map"};
+    Ros2TopicParams scan_topic{"scan"};
+    Ros2TopicParams internal_map_topic{"internal_map"};
+
+    ERL_REFLECT_SCHEMA(
+        FrontierBasedGrid2dNodeConfig,
+        ERL_REFLECT_MEMBER(FrontierBasedGrid2dNodeConfig, agent_config_file),
+        ERL_REFLECT_MEMBER(FrontierBasedGrid2dNodeConfig, map_min),
+        ERL_REFLECT_MEMBER(FrontierBasedGrid2dNodeConfig, map_max),
+        ERL_REFLECT_MEMBER(FrontierBasedGrid2dNodeConfig, map_resolution),
+        ERL_REFLECT_MEMBER(FrontierBasedGrid2dNodeConfig, use_external_map),
+        ERL_REFLECT_MEMBER(FrontierBasedGrid2dNodeConfig, map_topic),
+        ERL_REFLECT_MEMBER(FrontierBasedGrid2dNodeConfig, scan_topic),
+        ERL_REFLECT_MEMBER(FrontierBasedGrid2dNodeConfig, internal_map_topic));
+
+    bool
+    PostDeserialization() override {
+        auto logger = g_active_mapping_node->get_logger();
+
+        if (agent_config_file.empty()) {
+            RCLCPP_WARN(logger, "agent_config_file is not set");
+            return false;
+        }
+        if (!std::filesystem::exists(agent_config_file)) {
+            RCLCPP_WARN(
+                logger,
+                "Agent configuration file %s does not exist",
+                agent_config_file.c_str());
+            return false;
+        }
+        if (map_min.size() != 2 || map_max.size() != 2) {
+            RCLCPP_WARN(
+                logger,
+                "map_min and map_max should be of size 2, got %lu and %lu",
+                map_min.size(),
+                map_max.size());
+            return false;
+        }
+        if (map_resolution <= 0) {
+            RCLCPP_WARN(
+                logger,
+                "map_resolution should be positive, got %f",
+                map_resolution);
+            return false;
+        }
+        if (map_topic.path.empty()) {
+            RCLCPP_WARN(logger, "map_topic.path is empty");
+            return false;
+        }
+        if (scan_topic.path.empty()) {
+            RCLCPP_WARN(logger, "scan_topic.path is empty");
+            return false;
+        }
+        if (internal_map_topic.path.empty()) {
+            RCLCPP_WARN(logger, "internal_map_topic.path is empty");
+            return false;
+        }
+        return true;
+    }
+};
+
 template<typename Dtype>
 class FrontierBasedGrid2dNode : public ActiveMappingNode<Agent<Dtype>, Dtype, 2> {
 public:
@@ -18,21 +88,7 @@ public:
     using Observation = typename Agent_t::Observation_t;
 
 protected:
-    std::string m_agent_config_file_;
-    std::vector<double> m_map_min_ = {-10.1, -10.1};
-    std::vector<double> m_map_max_ = {10.1, 10.1};
-    double m_map_resolution_ = 0.05;
-
-    bool m_use_external_map_ = false;
-    std::string m_map_topic_ = "map";
-    std::string m_map_topic_reliability_ = "reliable";
-    std::string m_map_topic_durability_ = "transient_local";
-    std::string m_scan_topic_ = "scan";
-    std::string m_scan_topic_reliability_ = "reliable";
-    std::string m_scan_topic_durability_ = "volatile";
-    std::string m_internal_map_topic_ = "internal_map";
-    std::string m_internal_map_topic_reliability_ = "reliable";
-    std::string m_internal_map_topic_durability_ = "transient_local";
+    FrontierBasedGrid2dNodeConfig m_derived_config_;
 
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr m_map_sub_ = nullptr;
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr m_laser_sub_ = nullptr;
@@ -46,168 +102,72 @@ public:
     explicit FrontierBasedGrid2dNode(const std::string &node_name)
         : ActiveMappingNode<Agent<Dtype>, Dtype, 2>(node_name) {
 
-        this->declare_parameter("agent_config_file", m_agent_config_file_);
-        this->declare_parameter("map_min", m_map_min_);
-        this->declare_parameter("map_max", m_map_max_);
-        this->declare_parameter("map_resolution", m_map_resolution_);
-        this->declare_parameter("use_external_map", m_use_external_map_);
-        this->declare_parameter("map_topic", m_map_topic_);
-        this->declare_parameter("map_topic_reliability", this->m_default_qos_reliability_);
-        this->declare_parameter("map_topic_durability", this->m_default_qos_durability_);
-        this->declare_parameter("scan_topic", m_scan_topic_);
-        this->declare_parameter("scan_topic_reliability", this->m_default_qos_reliability_);
-        this->declare_parameter("scan_topic_durability", this->m_default_qos_durability_);
-        this->declare_parameter("internal_map_topic", m_internal_map_topic_);
-        this->declare_parameter("internal_map_topic_reliability", this->m_default_qos_reliability_);
-        this->declare_parameter("internal_map_topic_durability", this->m_default_qos_durability_);
-
-        // Get parameters
-#define GET_PARAM(param_name, member)                           \
-    if (!this->get_parameter(param_name, member)) {             \
-        RCLCPP_WARN(                                            \
-            this->get_logger(),                                 \
-            "Failed to get parameter %s, using default value.", \
-            param_name);                                        \
-    }                                                           \
-    (void) 0
-        GET_PARAM("agent_config_file", m_agent_config_file_);
-        GET_PARAM("map_min", m_map_min_);
-        GET_PARAM("map_max", m_map_max_);
-        GET_PARAM("map_resolution", m_map_resolution_);
-        GET_PARAM("use_external_map", m_use_external_map_);
-        GET_PARAM("map_topic", m_map_topic_);
-        GET_PARAM("map_topic_reliability", m_map_topic_reliability_);
-        GET_PARAM("map_topic_durability", m_map_topic_durability_);
-        GET_PARAM("scan_topic", m_scan_topic_);
-        GET_PARAM("scan_topic_reliability", m_scan_topic_reliability_);
-        GET_PARAM("scan_topic_durability", m_scan_topic_durability_);
-        GET_PARAM("internal_map_topic", m_internal_map_topic_);
-        GET_PARAM("internal_map_topic_reliability", m_internal_map_topic_reliability_);
-        GET_PARAM("internal_map_topic_durability", m_internal_map_topic_durability_);
-#undef GET_PARAM
-
-        if (m_agent_config_file_.empty()) {
-            RCLCPP_ERROR(this->get_logger(), "Agent configuration file is not set.");
+        if (!m_derived_config_.LoadFromRos2(this, "")) {
+            RCLCPP_FATAL(this->get_logger(), "Failed to load FrontierBasedGrid2dNodeConfig parameters");
             rclcpp::shutdown();
-            exit(EXIT_FAILURE);
-        }
-
-        if (!std::filesystem::exists(m_agent_config_file_)) {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "Agent configuration file %s does not exist.",
-                m_agent_config_file_.c_str());
-            rclcpp::shutdown();
-            exit(EXIT_FAILURE);
-        }
-
-        if (m_map_min_.size() != 2 || m_map_max_.size() != 2) {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "map_min and map_max should be of size 2, got %lu and %lu",
-                m_map_min_.size(),
-                m_map_max_.size());
-            rclcpp::shutdown();
-            exit(EXIT_FAILURE);
-        }
-
-        if (m_map_resolution_ <= 0) {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "map_resolution should be positive, got %f",
-                m_map_resolution_);
-            rclcpp::shutdown();
-            exit(EXIT_FAILURE);
+            return;
         }
 
         RCLCPP_INFO(
             this->get_logger(),
-            "Parameters:\n"
-            "agent_config_file: %s\n"
-            "map_min: [%f, %f]\n"
-            "map_max: [%f, %f]\n"
-            "map_resolution: %f\n"
-            "use_external_map: %s\n"
-            "map_topic: %s\n"
-            "map_topic_reliability: %s\n"
-            "map_topic_durability: %s\n"
-            "scan_topic: %s\n"
-            "scan_topic_reliability: %s\n"
-            "scan_topic_durability: %s\n"
-            "internal_map_topic: %s\n"
-            "internal_map_topic_reliability: %s\n"
-            "internal_map_topic_durability: %s\n",
-            m_agent_config_file_.c_str(),
-            m_map_min_[0],
-            m_map_min_[1],
-            m_map_max_[0],
-            m_map_max_[1],
-            m_map_resolution_,
-            (m_use_external_map_ ? "true" : "false"),
-            m_map_topic_.c_str(),
-            m_map_topic_reliability_.c_str(),
-            m_map_topic_durability_.c_str(),
-            m_scan_topic_.c_str(),
-            m_scan_topic_reliability_.c_str(),
-            m_scan_topic_durability_.c_str(),
-            m_internal_map_topic_.c_str(),
-            m_internal_map_topic_reliability_.c_str(),
-            m_internal_map_topic_durability_.c_str());
+            "Loaded FrontierBasedGrid2dNodeConfig:\n%s",
+            m_derived_config_.AsYamlString().c_str());
 
         // Load agent configuration
         try {
-            if (!m_agent_setting_->FromYamlFile(m_agent_config_file_)) {
-                RCLCPP_INFO(
+            if (!m_agent_setting_->FromYamlFile(m_derived_config_.agent_config_file)) {
+                RCLCPP_FATAL(
                     this->get_logger(),
                     "Failed to load agent configuration from %s",
-                    m_agent_config_file_.c_str());
+                    m_derived_config_.agent_config_file.c_str());
                 rclcpp::shutdown();
-                exit(EXIT_FAILURE);
+                return;
             }
             RCLCPP_INFO(
                 this->get_logger(),
                 "Loaded agent configuration from %s:\n%s",
-                m_agent_config_file_.c_str(),
+                m_derived_config_.agent_config_file.c_str(),
                 m_agent_setting_->AsYamlString().c_str());
         } catch (const std::exception &e) {
-            RCLCPP_ERROR(
+            RCLCPP_FATAL(
                 this->get_logger(),
                 "Failed to load agent configuration file %s: %s",
-                m_agent_config_file_.c_str(),
+                m_derived_config_.agent_config_file.c_str(),
                 e.what());
             rclcpp::shutdown();
-            exit(EXIT_FAILURE);
+            return;
         }
 
         m_grid_map_info_ = std::make_shared<GridMapInfo>(
-            Eigen::Vector2<Dtype>(m_map_min_[0], m_map_min_[1]),
-            Eigen::Vector2<Dtype>(m_map_max_[0], m_map_max_[1]),
-            Eigen::Vector2<Dtype>(m_map_resolution_, m_map_resolution_),
+            Eigen::Vector2<Dtype>(m_derived_config_.map_min[0], m_derived_config_.map_min[1]),
+            Eigen::Vector2<Dtype>(m_derived_config_.map_max[0], m_derived_config_.map_max[1]),
+            Eigen::Vector2<Dtype>(m_derived_config_.map_resolution, m_derived_config_.map_resolution),
             Eigen::Vector2i::Zero());
         this->m_agent_ = std::make_shared<Agent_t>(m_agent_setting_, m_grid_map_info_);
 
-        if (m_use_external_map_) {
-            // Subscribe to map topic
+        if (m_derived_config_.use_external_map) {
             m_map_sub_ = this->template create_subscription<nav_msgs::msg::OccupancyGrid>(
-                m_map_topic_,
-                Super::GetQoS(m_map_topic_reliability_, m_map_topic_durability_),
+                m_derived_config_.map_topic.path,
+                m_derived_config_.map_topic.GetQoS(),
                 std::bind(&FrontierBasedGrid2dNode::CallbackMap, this, std::placeholders::_1));
-            RCLCPP_INFO(this->get_logger(), "Subscribed to map topic %s", m_map_topic_.c_str());
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Subscribed to map topic %s",
+                m_derived_config_.map_topic.path.c_str());
         } else {
-            // Subscribe to laser scan topic
             m_laser_sub_ = this->template create_subscription<sensor_msgs::msg::LaserScan>(
-                m_scan_topic_,
-                Super::GetQoS(m_scan_topic_reliability_, m_scan_topic_durability_),
+                m_derived_config_.scan_topic.path,
+                m_derived_config_.scan_topic.GetQoS(),
                 std::bind(&FrontierBasedGrid2dNode::CallbackLaser, this, std::placeholders::_1));
             RCLCPP_INFO(
                 this->get_logger(),
                 "Subscribed to laser scan topic %s",
-                m_scan_topic_.c_str());
+                m_derived_config_.scan_topic.path.c_str());
         }
 
         m_internal_map_pub_ = this->template create_publisher<nav_msgs::msg::OccupancyGrid>(
-            m_internal_map_topic_,
-            Super::GetQoS(m_internal_map_topic_reliability_, m_internal_map_topic_durability_));
+            m_derived_config_.internal_map_topic.path,
+            m_derived_config_.internal_map_topic.GetQoS());
     }
 
     void
@@ -326,7 +286,7 @@ public:
 
         nav_msgs::msg::OccupancyGrid msg;
         msg.header.stamp = stamp;
-        msg.header.frame_id = this->m_global_frame_;
+        msg.header.frame_id = this->m_config_.global_frame;
         msg.info.resolution = static_cast<float>(grid_map_info->Resolution(0));
         msg.info.width = static_cast<uint32_t>(occ_map.cols);
         msg.info.height = static_cast<uint32_t>(occ_map.rows);
