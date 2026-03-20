@@ -10,7 +10,7 @@ using Agent = erl::active_mapping::frontier_based::AgentFrontierBasedGrid2D<Dtyp
 using namespace erl::common;
 using namespace erl::common::ros_params;
 
-struct FrontierBasedGrid2dNodeConfig : public Yamlable<FrontierBasedGrid2dNodeConfig> {
+struct FrontierBasedGrid2dNodeConfig : public Yamlable<FrontierBasedGrid2dNodeConfig, ActiveMappingNodeConfig> {
     std::string agent_config_file;
     std::vector<double> map_min = {-10.1, -10.1};
     std::vector<double> map_max = {10.1, 10.1};

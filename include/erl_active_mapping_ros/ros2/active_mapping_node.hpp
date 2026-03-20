@@ -21,6 +21,7 @@ inline rclcpp::Node *g_active_mapping_node = nullptr;
 
 struct ActiveMappingNodeConfig : public erl::common::Yamlable<ActiveMappingNodeConfig> {
     using Ros2TopicParams = erl::common::ros_params::Ros2TopicParams;
+
     std::string global_frame = "map";
     std::string robot_frame = "base_link";
     bool auto_replan = false;

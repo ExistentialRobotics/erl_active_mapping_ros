@@ -45,8 +45,6 @@ def generate_launch_description():
                 output="screen",
                 parameters=[
                     {
-                        "default_qos_reliability": "reliable",
-                        "default_qos_durability": "transient_local",
                         "map_file": PathJoinSubstitution(
                             [
                                 FindPackageShare("erl_geometry"),
@@ -60,8 +58,12 @@ def generate_launch_description():
                         "init_x": 6.61,
                         "init_y": 6.46,
                         "init_yaw": 0.0,
-                        "path_topic": "path",
-                        "scan_topic": "scan",
+                        "path_topic.path": "path",
+                        "path_topic.qos_reliability": "reliable",
+                        "path_topic.qos_durability": "transient_local",
+                        "scan_topic.path": "scan",
+                        "scan_topic.qos_reliability": "reliable",
+                        "scan_topic.qos_durability": "transient_local",
                     }
                 ],
             ),
