@@ -260,14 +260,8 @@ public:
         }
     }
 
-    [[nodiscard]] Dtype
-    ComputeObservedArea() const {
-        auto log_odd_map = m_agent_->GetLogOddMap();
-        std::size_t num_free_cells = log_odd_map->GetNumFreeCells();
-        Eigen::Vector2<Dtype> res = log_odd_map->GetGridMapInfo()->Resolution();
-        Dtype area = static_cast<Dtype>(num_free_cells) * res[0] * res[1];
-        return area;
-    }
+    [[nodiscard]] virtual Dtype
+    ComputeObservedArea() const = 0;
 
     void
     CallbackSrvPlan(

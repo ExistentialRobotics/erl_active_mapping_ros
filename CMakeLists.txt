@@ -9,11 +9,11 @@ message(STATUS "Configuring ${PROJECT_NAME} ${PROJECT_VERSION}")
 if(NOT COMMAND erl_project_setup)
     find_package(erl_cmake_tools REQUIRED)
 endif()
-erl_project_setup(ERL_PACKAGES erl_active_mapping)
+erl_project_setup(ERL_PACKAGES erl_active_mapping erl_geometry_msgs)
 erl_setup_ros(
-    CATKIN_COMPONENTS roscpp geometry_msgs sensor_msgs tf2_ros nav_msgs std_srvs
-    CATKIN_DEPENDS roscpp geometry_msgs sensor_msgs tf2_ros nav_msgs std_srvs
-    ROS2_COMPONENTS rclcpp geometry_msgs sensor_msgs tf2_ros nav_msgs std_srvs)
+    CATKIN_COMPONENTS roscpp geometry_msgs sensor_msgs tf2_ros nav_msgs std_srvs erl_geometry_msgs
+    CATKIN_DEPENDS roscpp geometry_msgs sensor_msgs tf2_ros nav_msgs std_srvs erl_geometry_msgs
+    ROS2_COMPONENTS rclcpp geometry_msgs sensor_msgs tf2_ros nav_msgs std_srvs erl_geometry_msgs)
 include_directories(include)
 erl_add_ros_src()
 erl_install(EXECUTABLES ${${PROJECT_NAME}_COLLECTED_EXECUTABLES})

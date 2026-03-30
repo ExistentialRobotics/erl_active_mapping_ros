@@ -1,5 +1,7 @@
 #include "erl_active_mapping/frontier_based_grid_2d.hpp"
 #include "erl_active_mapping_ros/ros2/active_mapping_node.hpp"
+#include "erl_geometry/bresenham_2d.hpp"
+#include "erl_geometry_msgs/msg/frontier_array.hpp"
 
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
@@ -10,14 +12,17 @@ using Agent = erl::active_mapping::frontier_based::AgentFrontierBasedGrid2D<Dtyp
 using namespace erl::common;
 using namespace erl::common::ros_params;
 
-struct FrontierBasedGrid2dNodeConfig : public Yamlable<FrontierBasedGrid2dNodeConfig, ActiveMappingNodeConfig> {
+struct FrontierBasedGrid2dNodeConfig
+    : public Yamlable<FrontierBasedGrid2dNodeConfig, ActiveMappingNodeConfig> {
     std::string agent_config_file;
     std::vector<double> map_min = {-10.1, -10.1};
     std::vector<double> map_max = {10.1, 10.1};
     double map_resolution = 0.05;
     bool use_external_map = false;
+    bool use_external_frontier = false;
     Ros2TopicParams map_topic{"map"};
     Ros2TopicParams scan_topic{"scan"};
+    Ros2TopicParams frontier_topic{"frontier"};
     Ros2TopicParams internal_map_topic{"internal_map"};
 
     ERL_REFLECT_SCHEMA(
@@ -27,8 +32,10 @@ struct FrontierBasedGrid2dNodeConfig : public Yamlable<FrontierBasedGrid2dNodeCo
         ERL_REFLECT_MEMBER(FrontierBasedGrid2dNodeConfig, map_max),
         ERL_REFLECT_MEMBER(FrontierBasedGrid2dNodeConfig, map_resolution),
         ERL_REFLECT_MEMBER(FrontierBasedGrid2dNodeConfig, use_external_map),
+        ERL_REFLECT_MEMBER(FrontierBasedGrid2dNodeConfig, use_external_frontier),
         ERL_REFLECT_MEMBER(FrontierBasedGrid2dNodeConfig, map_topic),
         ERL_REFLECT_MEMBER(FrontierBasedGrid2dNodeConfig, scan_topic),
+        ERL_REFLECT_MEMBER(FrontierBasedGrid2dNodeConfig, frontier_topic),
         ERL_REFLECT_MEMBER(FrontierBasedGrid2dNodeConfig, internal_map_topic));
 
     bool
@@ -55,18 +62,19 @@ struct FrontierBasedGrid2dNodeConfig : public Yamlable<FrontierBasedGrid2dNodeCo
             return false;
         }
         if (map_resolution <= 0) {
-            RCLCPP_WARN(
-                logger,
-                "map_resolution should be positive, got %f",
-                map_resolution);
+            RCLCPP_WARN(logger, "map_resolution should be positive, got %f", map_resolution);
             return false;
         }
-        if (map_topic.path.empty()) {
+        if (use_external_map && map_topic.path.empty()) {
             RCLCPP_WARN(logger, "map_topic.path is empty");
             return false;
         }
-        if (scan_topic.path.empty()) {
+        if (!use_external_map && scan_topic.path.empty()) {
             RCLCPP_WARN(logger, "scan_topic.path is empty");
+            return false;
+        }
+        if (use_external_frontier && frontier_topic.path.empty()) {
+            RCLCPP_WARN(logger, "frontier_topic.path is empty");
             return false;
         }
         if (internal_map_topic.path.empty()) {
@@ -89,10 +97,15 @@ public:
 
 protected:
     FrontierBasedGrid2dNodeConfig m_derived_config_;
-
+    // map subscription to the external map for updating the internal map. Used if use_external_map
+    // is true.
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr m_map_sub_ = nullptr;
+    // laser scan subscription for updating the internal map. Used if use_external_map is false.
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr m_laser_sub_ = nullptr;
-
+    // frontier subscription for loading external frontiers. Used if use_external_frontier is true.
+    rclcpp::Subscription<erl_geometry_msgs::msg::FrontierArray>::SharedPtr m_frontier_sub_ =
+        nullptr;
+    // for visualization and debugging, we also publish the internal map as nav_msgs/OccupancyGrid
     rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr m_internal_map_pub_ = nullptr;
 
     std::shared_ptr<AgentSetting> m_agent_setting_ = std::make_shared<AgentSetting>();
@@ -103,7 +116,9 @@ public:
         : ActiveMappingNode<Agent<Dtype>, Dtype, 2>(node_name) {
 
         if (!m_derived_config_.LoadFromRos2(this, "")) {
-            RCLCPP_FATAL(this->get_logger(), "Failed to load FrontierBasedGrid2dNodeConfig parameters");
+            RCLCPP_FATAL(
+                this->get_logger(),
+                "Failed to load FrontierBasedGrid2dNodeConfig parameters");
             rclcpp::shutdown();
             return;
         }
@@ -141,7 +156,9 @@ public:
         m_grid_map_info_ = std::make_shared<GridMapInfo>(
             Eigen::Vector2<Dtype>(m_derived_config_.map_min[0], m_derived_config_.map_min[1]),
             Eigen::Vector2<Dtype>(m_derived_config_.map_max[0], m_derived_config_.map_max[1]),
-            Eigen::Vector2<Dtype>(m_derived_config_.map_resolution, m_derived_config_.map_resolution),
+            Eigen::Vector2<Dtype>(
+                m_derived_config_.map_resolution,
+                m_derived_config_.map_resolution),
             Eigen::Vector2i::Zero());
         this->m_agent_ = std::make_shared<Agent_t>(m_agent_setting_, m_grid_map_info_);
 
@@ -163,6 +180,21 @@ public:
                 this->get_logger(),
                 "Subscribed to laser scan topic %s",
                 m_derived_config_.scan_topic.path.c_str());
+        }
+
+        if (m_derived_config_.use_external_frontier) {
+            m_frontier_sub_ =
+                this->template create_subscription<erl_geometry_msgs::msg::FrontierArray>(
+                    m_derived_config_.frontier_topic.path,
+                    m_derived_config_.frontier_topic.GetQoS(),
+                    std::bind(
+                        &FrontierBasedGrid2dNode::CallbackFrontier,
+                        this,
+                        std::placeholders::_1));
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Subscribed to frontier topic %s",
+                m_derived_config_.frontier_topic.path.c_str());
         }
 
         m_internal_map_pub_ = this->template create_publisher<nav_msgs::msg::OccupancyGrid>(
@@ -268,6 +300,65 @@ public:
     }
 
     void
+    CallbackFrontier(const erl_geometry_msgs::msg::FrontierArray::SharedPtr msg) {
+        if (msg == nullptr) {
+            RCLCPP_WARN(this->get_logger(), "Received null frontier message.");
+            return;
+        }
+
+        if (msg->dim != 2) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Received frontier with dimension %u, but only 2D frontier is supported.",
+                msg->dim);
+            return;
+        }
+
+        using Frontier = typename Agent_t::Frontier;
+        std::vector<Frontier> frontiers;
+
+        const auto grid_map_info = this->m_agent_->GetLogOddMap()->GetGridMapInfo();
+
+        for (const erl_geometry_msgs::msg::Frontier &msg_frontier: msg->frontiers) {
+            Frontier frontier;
+            // set frontier.points
+            const auto num_vertices = static_cast<long>(msg_frontier.vertices.size());
+            if (num_vertices == 0) { continue; }
+            frontier.points.resize(2, num_vertices);
+            long n = 0;
+            Eigen::Vector2i start;
+            start[0] =
+                grid_map_info->MeterToGridAtDim(static_cast<Dtype>(msg_frontier.vertices[0].x), 0);
+            start[1] =
+                grid_map_info->MeterToGridAtDim(static_cast<Dtype>(msg_frontier.vertices[0].y), 1);
+            Eigen::Vector2i end;
+            for (long i = 1; i < num_vertices; ++i) {
+                end[0] = grid_map_info->MeterToGridAtDim(
+                    static_cast<Dtype>(msg_frontier.vertices[i].x),
+                    0);
+                end[1] = grid_map_info->MeterToGridAtDim(
+                    static_cast<Dtype>(msg_frontier.vertices[i].y),
+                    1);
+                // Process the segment from start to end
+                Eigen::Matrix2Xi seg_pts = erl::geometry::Bresenham2D(start, end);
+                if (n + seg_pts.cols() > frontier.points.cols()) {
+                    long new_cols = std::max(frontier.points.cols() * 2, n + seg_pts.cols());
+                    frontier.points.conservativeResize(Eigen::NoChange, new_cols);
+                }
+                frontier.points.block(0, n, 2, seg_pts.cols()) = seg_pts;
+                n += seg_pts.cols();
+                // move start to end
+                start = end;
+            }
+            frontier.points.conservativeResize(Eigen::NoChange, n);
+            // set other frontier properties
+            frontier.score = msg_frontier.score;
+            frontiers.push_back(std::move(frontier));
+        }
+        this->m_agent_->SetFrontiers(frontiers);
+    }
+
+    void
     PublishInternalMap(const rclcpp::Time &stamp) {
         auto log_odd_map = this->m_agent_->GetLogOddMap();
         cv::Mat occ_map = log_odd_map->GetOccupancyMap();
@@ -301,6 +392,15 @@ public:
         std::memcpy(msg.data.data(), occ_map_eigen.data(), sizeof(int8_t) * msg.data.size());
 
         m_internal_map_pub_->publish(msg);
+    }
+
+    [[nodiscard]] Dtype
+    ComputeObservedArea() const override {
+        auto log_odd_map = this->m_agent_->GetLogOddMap();
+        std::size_t num_free_cells = log_odd_map->GetNumFreeCells();
+        Eigen::Vector2<Dtype> res = log_odd_map->GetGridMapInfo()->Resolution();
+        Dtype area = static_cast<Dtype>(num_free_cells) * res[0] * res[1];
+        return area;
     }
 };
 
