@@ -11,6 +11,7 @@
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_srvs/srv/set_bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/buffer.hpp>
 #include <tf2_ros/transform_listener.hpp>
@@ -27,11 +28,13 @@ struct ActiveMappingNodeConfig : public erl::common::Yamlable<ActiveMappingNodeC
     bool auto_replan = false;
     double stop_exploration_ratio = 0.95;
     Ros2TopicParams path_topic{"path"};
+    Ros2TopicParams goal_topic{"goal"};
     Ros2TopicParams dist_topic{"distance"};
     Ros2TopicParams observed_area_topic{"observed_area"};
     Ros2TopicParams observed_ratio_topic{"observed_ratio"};
     Ros2TopicParams replan_topic{"replan"};
     Ros2TopicParams plan_srv{"plan_path", "services"};
+    Ros2TopicParams enable_srv{"enable", "services"};
     double max_observed_area = 10.0;
 
     ERL_REFLECT_SCHEMA(
@@ -41,11 +44,13 @@ struct ActiveMappingNodeConfig : public erl::common::Yamlable<ActiveMappingNodeC
         ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, auto_replan),
         ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, stop_exploration_ratio),
         ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, path_topic),
+        ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, goal_topic),
         ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, dist_topic),
         ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, observed_area_topic),
         ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, observed_ratio_topic),
         ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, replan_topic),
         ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, plan_srv),
+        ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, enable_srv),
         ERL_REFLECT_MEMBER(ActiveMappingNodeConfig, max_observed_area));
 
     bool
@@ -67,11 +72,18 @@ struct ActiveMappingNodeConfig : public erl::common::Yamlable<ActiveMappingNodeC
             return false;
         }
         if (max_observed_area <= 0.0) {
-            RCLCPP_WARN(logger, "max_observed_area must be positive, got %f", max_observed_area);
-            return false;
+            if (max_observed_area == 0.0) { max_observed_area = -1.0; }
+            RCLCPP_WARN(
+                logger,
+                "max_observed_area (%f) is not positive, auto_stop will be disabled.",
+                max_observed_area);
         }
         if (path_topic.path.empty()) {
             RCLCPP_WARN(logger, "path_topic.path is empty");
+            return false;
+        }
+        if (goal_topic.path.empty()) {
+            RCLCPP_WARN(logger, "goal_topic.path is empty");
             return false;
         }
         if (dist_topic.path.empty()) {
@@ -88,6 +100,14 @@ struct ActiveMappingNodeConfig : public erl::common::Yamlable<ActiveMappingNodeC
         }
         if (replan_topic.path.empty()) {
             RCLCPP_WARN(logger, "replan_topic.path is empty");
+            return false;
+        }
+        if (plan_srv.path.empty()) {
+            RCLCPP_WARN(logger, "plan_srv.path is empty");
+            return false;
+        }
+        if (enable_srv.path.empty()) {
+            RCLCPP_WARN(logger, "enable_srv.path is empty");
             return false;
         }
         return true;
@@ -112,12 +132,14 @@ protected:
     std::shared_ptr<tf2_ros::TransformListener> m_tf_listener_;
 
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr m_path_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr m_goal_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr m_dist_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr m_observed_area_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr m_observed_ratio_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr m_replan_pub_;
 
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr m_plan_srv_;
+    rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr m_enable_srv_;
 
     std::shared_ptr<Agent> m_agent_ = nullptr;
     Pose m_last_pose_ = Pose::Identity();
@@ -128,6 +150,7 @@ protected:
     Dtype m_observed_area_ = 0;
     Dtype m_ratio_ = 0;
     bool m_replan_ = false;
+    bool m_enabled_ = true;
 
 public:
     explicit ActiveMappingNode(const std::string &node_name)
@@ -191,6 +214,9 @@ public:
         m_path_pub_ = this->create_publisher<nav_msgs::msg::Path>(
             m_config_.path_topic.path,
             m_config_.path_topic.GetQoS());
+        m_goal_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+            m_config_.goal_topic.path,
+            m_config_.goal_topic.GetQoS());
         m_dist_pub_ = this->create_publisher<std_msgs::msg::Float64>(
             m_config_.dist_topic.path,
             m_config_.dist_topic.GetQoS());
@@ -212,6 +238,14 @@ public:
                 std::placeholders::_1,
                 std::placeholders::_2),
             m_config_.plan_srv.GetQoS().get_rmw_qos_profile());
+        m_enable_srv_ = this->create_service<std_srvs::srv::SetBool>(
+            m_config_.enable_srv.path,
+            std::bind(
+                &ActiveMappingNode::CallbackSrvEnable,
+                this,
+                std::placeholders::_1,
+                std::placeholders::_2),
+            m_config_.enable_srv.GetQoS().get_rmw_qos_profile());
 #else
         m_plan_srv_ = this->create_service<std_srvs::srv::Trigger>(
             m_config_.plan_srv.path,
@@ -221,8 +255,15 @@ public:
                 std::placeholders::_1,
                 std::placeholders::_2),
             m_config_.plan_srv.GetQoS());
+        m_enable_srv_ = this->create_service<std_srvs::srv::SetBool>(
+            m_config_.enable_srv.path,
+            std::bind(
+                &ActiveMappingNode::CallbackSrvEnable,
+                this,
+                std::placeholders::_1,
+                std::placeholders::_2),
+            m_config_.enable_srv.GetQoS());
 #endif
-
     }
 
     virtual ~ActiveMappingNode() = default;
@@ -248,7 +289,7 @@ public:
 
         PublishStats();
 
-        if (m_config_.auto_replan && m_replan_) {
+        if (m_enabled_ && m_config_.auto_replan && m_replan_) {
             m_path_ = m_agent_->Plan(cur_pose);
             RCLCPP_INFO(
                 this->get_logger(),
@@ -310,6 +351,16 @@ public:
     }
 
     void
+    CallbackSrvEnable(
+        const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+        std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
+        m_enabled_ = request->data;
+        response->success = true;
+        response->message = m_enabled_ ? "Planning enabled." : "Planning disabled.";
+        RCLCPP_INFO(this->get_logger(), "%s", response->message.c_str());
+    }
+
+    void
     PublishStats() {
         std_msgs::msg::Float64 dist_msg;
         dist_msg.data = static_cast<double>(m_dist_);
@@ -360,6 +411,7 @@ public:
             pose_msg.pose.orientation.w = q.w();
         }
         m_path_pub_->publish(path_msg);
+        m_goal_pub_->publish(path_msg.poses.back());
     }
 
     bool

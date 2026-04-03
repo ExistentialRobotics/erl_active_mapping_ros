@@ -111,6 +111,10 @@ protected:
     std::shared_ptr<AgentSetting> m_agent_setting_ = std::make_shared<AgentSetting>();
     std::shared_ptr<GridMapInfo> m_grid_map_info_ = nullptr;
 
+    nav_msgs::msg::OccupancyGrid::SharedPtr m_latest_map_msg_ = nullptr;
+    erl_geometry_msgs::msg::FrontierArray::SharedPtr m_latest_frontier_msg_ = nullptr;
+    bool m_map_initialized_ = false;  // true after the first external map is loaded
+
 public:
     explicit FrontierBasedGrid2dNode(const std::string &node_name)
         : ActiveMappingNode<Agent<Dtype>, Dtype, 2>(node_name) {
@@ -161,6 +165,7 @@ public:
                 m_derived_config_.map_resolution),
             Eigen::Vector2i::Zero());
         this->m_agent_ = std::make_shared<Agent_t>(m_agent_setting_, m_grid_map_info_);
+        m_map_initialized_ = !m_derived_config_.use_external_map;
 
         if (m_derived_config_.use_external_map) {
             m_map_sub_ = this->template create_subscription<nav_msgs::msg::OccupancyGrid>(
@@ -208,44 +213,8 @@ public:
             RCLCPP_WARN(this->get_logger(), "Received null map message.");
             return;
         }
-        const Dtype res = static_cast<Dtype>(msg->info.resolution);
-        const Dtype min_x = static_cast<Dtype>(msg->info.origin.position.x);
-        const Dtype min_y = static_cast<Dtype>(msg->info.origin.position.y);
-
-        auto grid_map_info = std::make_shared<GridMapInfo>(
-            Eigen::Vector2<Dtype>(min_x, min_y),
-            Eigen::Vector2<Dtype>(
-                min_x + static_cast<Dtype>(msg->info.width) * res,
-                min_y + static_cast<Dtype>(msg->info.height) * res),
-            Eigen::Vector2<Dtype>(res, res),
-            Eigen::Vector2i(msg->info.width, msg->info.height));
-
-        geometry_msgs::msg::TransformStamped pose;
-        this->GetPoseFromTf(msg->header.stamp, pose);
-        const Eigen::Vector2<Dtype> agent_pos(
-            static_cast<Dtype>(pose.transform.translation.x),
-            static_cast<Dtype>(pose.transform.translation.y));
-        Eigen::Matrix3<Dtype> rotation = Eigen::Quaternion<Dtype>(
-                                             pose.transform.rotation.w,
-                                             pose.transform.rotation.x,
-                                             pose.transform.rotation.y,
-                                             pose.transform.rotation.z)
-                                             .toRotationMatrix();
-        const Dtype theta = std::atan2(rotation(1, 0), rotation(0, 0));
-        Eigen::Map<const Eigen::MatrixX<int8_t>> occ_map(
-            msg->data.data(),
-            msg->info.width,    // x
-            msg->info.height);  // y
-        this->m_agent_->GetLogOddMap()
-            ->template LoadExternalPossibilityMap<int8_t>(agent_pos, theta, occ_map, grid_map_info);
-        PublishInternalMap(msg->header.stamp);
-
-        Pose cur_pose;
-        const Dtype cos_theta = std::cos(theta);
-        const Dtype sin_theta = std::sin(theta);
-        cur_pose << cos_theta, -sin_theta, agent_pos[0], sin_theta, cos_theta, agent_pos[1];
-        // we load the external map. no observation is needed. no need to step the agent.
-        this->Step(cur_pose, {} /* observation */, false /* step_agent */);
+        m_latest_map_msg_ = msg;
+        ProcessExternalSources();
     }
 
     void
@@ -255,25 +224,10 @@ public:
             return;
         }
 
-        geometry_msgs::msg::TransformStamped pose;
-        if (!this->GetPoseFromTf(msg->header.stamp, pose)) {
-            RCLCPP_WARN(
-                this->get_logger(),
-                "Failed to get robot pose at time %u.%u from TF.",
-                msg->header.stamp.sec,
-                msg->header.stamp.nanosec);
-            return;
-        }
-        const Eigen::Vector2<Dtype> agent_pos(
-            static_cast<Dtype>(pose.transform.translation.x),
-            static_cast<Dtype>(pose.transform.translation.y));
-        Eigen::Matrix2<Dtype> rotation = Eigen::Quaternion<Dtype>(
-                                             pose.transform.rotation.w,
-                                             pose.transform.rotation.x,
-                                             pose.transform.rotation.y,
-                                             pose.transform.rotation.z)
-                                             .toRotationMatrix()
-                                             .template block<2, 2>(0, 0);
+        Pose cur_pose;
+        if (!GetAgentPose(msg->header.stamp, cur_pose)) { return; }
+        Eigen::Matrix2<Dtype> rotation = cur_pose.template block<2, 2>(0, 0);
+        Eigen::Vector2<Dtype> agent_pos = cur_pose.col(2);
 
         Observation points(2, msg->ranges.size());
         float angle = msg->angle_min;
@@ -292,7 +246,6 @@ public:
         }
 
         points.conservativeResize(Eigen::NoChange, idx);
-        Pose cur_pose;
         cur_pose.template block<2, 2>(0, 0) = rotation;
         cur_pose.col(2) = agent_pos;
         this->Step(cur_pose, points, true /* step_agent */);  // step the agent to update the map
@@ -305,7 +258,6 @@ public:
             RCLCPP_WARN(this->get_logger(), "Received null frontier message.");
             return;
         }
-
         if (msg->dim != 2) {
             RCLCPP_WARN(
                 this->get_logger(),
@@ -313,49 +265,134 @@ public:
                 msg->dim);
             return;
         }
+        m_latest_frontier_msg_ = msg;
+        ProcessExternalSources();
+    }
 
-        using Frontier = typename Agent_t::Frontier;
-        std::vector<Frontier> frontiers;
+    void
+    ProcessExternalSources() {
+        // Wait for all required external sources
+        if (m_derived_config_.use_external_map && !m_latest_map_msg_) { return; }
+        if (m_derived_config_.use_external_frontier && !m_latest_frontier_msg_) { return; }
 
-        const auto grid_map_info = this->m_agent_->GetLogOddMap()->GetGridMapInfo();
+        const rclcpp::Time stamp = this->now();
+        Pose cur_pose;
+        if (!GetAgentPose(stamp, cur_pose)) { return; }
 
-        for (const erl_geometry_msgs::msg::Frontier &msg_frontier: msg->frontiers) {
-            Frontier frontier;
-            // set frontier.points
-            const auto num_vertices = static_cast<long>(msg_frontier.vertices.size());
-            if (num_vertices == 0) { continue; }
-            frontier.points.resize(2, num_vertices);
-            long n = 0;
-            Eigen::Vector2i start;
-            start[0] =
-                grid_map_info->MeterToGridAtDim(static_cast<Dtype>(msg_frontier.vertices[0].x), 0);
-            start[1] =
-                grid_map_info->MeterToGridAtDim(static_cast<Dtype>(msg_frontier.vertices[0].y), 1);
-            Eigen::Vector2i end;
-            for (long i = 1; i < num_vertices; ++i) {
-                end[0] = grid_map_info->MeterToGridAtDim(
-                    static_cast<Dtype>(msg_frontier.vertices[i].x),
-                    0);
-                end[1] = grid_map_info->MeterToGridAtDim(
-                    static_cast<Dtype>(msg_frontier.vertices[i].y),
-                    1);
-                // Process the segment from start to end
-                Eigen::Matrix2Xi seg_pts = erl::geometry::Bresenham2D(start, end);
-                if (n + seg_pts.cols() > frontier.points.cols()) {
-                    long new_cols = std::max(frontier.points.cols() * 2, n + seg_pts.cols());
-                    frontier.points.conservativeResize(Eigen::NoChange, new_cols);
-                }
-                frontier.points.block(0, n, 2, seg_pts.cols()) = seg_pts;
-                n += seg_pts.cols();
-                // move start to end
-                start = end;
-            }
-            frontier.points.conservativeResize(Eigen::NoChange, n);
-            // set other frontier properties
-            frontier.score = msg_frontier.score;
-            frontiers.push_back(std::move(frontier));
+        // 1. Load external map
+        if (m_latest_map_msg_) {
+            const auto &msg = m_latest_map_msg_;
+            const Dtype res = static_cast<Dtype>(msg->info.resolution);
+            const Dtype min_x = static_cast<Dtype>(msg->info.origin.position.x);
+            const Dtype min_y = static_cast<Dtype>(msg->info.origin.position.y);
+
+            const auto grid_map_info = std::make_shared<GridMapInfo>(
+                Eigen::Vector2i(msg->info.width, msg->info.height),
+                Eigen::Vector2<Dtype>(min_x, min_y),
+                Eigen::Vector2<Dtype>(
+                    min_x + static_cast<Dtype>(msg->info.width) * res,
+                    min_y + static_cast<Dtype>(msg->info.height) * res));
+
+            const Eigen::Vector2<Dtype> agent_pos = cur_pose.col(2);
+            const Dtype theta = std::atan2(cur_pose(1, 0), cur_pose(0, 0));
+
+            Eigen::Map<const Eigen::MatrixX<int8_t>> occ_map(
+                msg->data.data(),
+                msg->info.width,
+                msg->info.height);
+
+            this->m_agent_->GetLogOddMap()->template LoadExternalPossibilityMap<int8_t>(
+                agent_pos,
+                theta,
+                occ_map,
+                grid_map_info);
+            this->m_agent_->SetEnvOutdated(true);
+            m_map_initialized_ = true;
+
+            PublishInternalMap(stamp);
+            m_latest_map_msg_ = nullptr;
         }
-        this->m_agent_->SetFrontiers(frontiers);
+
+        // 2. Load external frontiers (grid_map_info is now up-to-date)
+        if (m_latest_frontier_msg_) {
+            const auto &msg = m_latest_frontier_msg_;
+            const auto grid_map_info = this->m_agent_->GetLogOddMap()->GetGridMapInfo();
+            const int width = grid_map_info->Shape(0);
+            const int height = grid_map_info->Shape(1);
+
+            using Frontier = typename Agent_t::Frontier;
+            std::vector<Frontier> frontiers;
+
+            for (const auto &msg_frontier: msg->frontiers) {
+                const auto num_vertices = static_cast<long>(msg_frontier.vertices.size());
+                if (num_vertices == 0) { continue; }
+
+                Frontier frontier;
+                frontier.points.resize(2, num_vertices);
+                long n = 0;
+                Eigen::Vector2i start(
+                    grid_map_info->MeterToGridAtDim(
+                        static_cast<Dtype>(msg_frontier.vertices[0].x),
+                        0),
+                    grid_map_info->MeterToGridAtDim(
+                        static_cast<Dtype>(msg_frontier.vertices[0].y),
+                        1));
+                for (long i = 1; i < num_vertices; ++i) {
+                    Eigen::Vector2i end(
+                        grid_map_info->MeterToGridAtDim(
+                            static_cast<Dtype>(msg_frontier.vertices[i].x),
+                            0),
+                        grid_map_info->MeterToGridAtDim(
+                            static_cast<Dtype>(msg_frontier.vertices[i].y),
+                            1));
+
+                    Eigen::Matrix2Xi seg_pts = erl::geometry::Bresenham2D(start, end);
+                    if (n + seg_pts.cols() > frontier.points.cols()) {
+                        long new_cols = std::max(frontier.points.cols() * 2, n + seg_pts.cols());
+                        frontier.points.conservativeResize(Eigen::NoChange, new_cols);
+                    }
+                    for (long j = 0; j < seg_pts.cols(); ++j) {
+                        auto p = seg_pts.col(j);
+                        if (p[0] < 0 || p[0] >= width || p[1] < 0 || p[1] >= height) { continue; }
+                        frontier.points.col(n++) = p;
+                    }
+                    start = end;
+                }
+                frontier.points.conservativeResize(Eigen::NoChange, n);
+                frontier.score = msg_frontier.score;
+                frontiers.push_back(std::move(frontier));
+            }
+            this->m_agent_->SetFrontiers(frontiers);
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Loaded %zu frontiers from external source.",
+                frontiers.size());
+            m_latest_frontier_msg_ = nullptr;
+        }
+
+        // 3. Step the agent
+        this->Step(cur_pose, {} /* observation */, false /* step_agent */);
+    }
+
+    bool
+    GetAgentPose(const rclcpp::Time &stamp, Pose &out_pose) {
+        geometry_msgs::msg::TransformStamped pose;
+        if (!this->GetPoseFromTf(stamp, pose)) { return false; }
+        Eigen::Matrix3<Dtype> rotation = Eigen::Quaternion<Dtype>(
+                                             pose.transform.rotation.w,
+                                             pose.transform.rotation.x,
+                                             pose.transform.rotation.y,
+                                             pose.transform.rotation.z)
+                                             .toRotationMatrix();
+        const Dtype theta = std::atan2(rotation(1, 0), rotation(0, 0));
+
+        const Dtype cos_theta = std::cos(theta);
+        const Dtype sin_theta = std::sin(theta);
+        // clang-format off
+        out_pose << cos_theta, -sin_theta, static_cast<Dtype>(pose.transform.translation.x),
+                    sin_theta, cos_theta, static_cast<Dtype>(pose.transform.translation.y);
+        // clang-format on
+        return true;
     }
 
     void
