@@ -289,6 +289,15 @@ public:
 
         PublishStats();
 
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Step %lu: dist=%.2f, observed_area=%.2f, ratio=%.3f, replan=%s",
+            m_step_,
+            m_dist_,
+            m_observed_area_,
+            m_ratio_,
+            m_replan_ ? "true" : "false");
+
         if (m_enabled_ && m_config_.auto_replan && m_replan_) {
             m_path_ = m_agent_->Plan(cur_pose);
             RCLCPP_INFO(
