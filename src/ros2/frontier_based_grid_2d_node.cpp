@@ -40,6 +40,10 @@ struct FrontierBasedGrid2dNodeConfig
 
     bool
     PostDeserialization() override {
+        if (!ActiveMappingNodeConfig::PostDeserialization()) {
+            return false;
+        }
+
         auto logger = g_active_mapping_node->get_logger();
 
         if (agent_config_file.empty()) {
