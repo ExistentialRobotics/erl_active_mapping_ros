@@ -275,15 +275,13 @@ public:
 
     void
     ProcessExternalSources() {
-        // Wait for all required external sources
-        if (m_derived_config_.use_external_map && !m_latest_map_msg_) { return; }
-        if (m_derived_config_.use_external_frontier && !m_latest_frontier_msg_) { return; }
+        bool updated = false;
 
         const rclcpp::Time stamp = this->now();
         Pose cur_pose;
         if (!GetAgentPose(stamp, cur_pose)) { return; }
 
-        // 1. Load external map
+        // 1. Load external map if a new one arrived
         if (m_latest_map_msg_) {
             const auto &msg = m_latest_map_msg_;
             const Dtype res = static_cast<Dtype>(msg->info.resolution);
@@ -315,10 +313,11 @@ public:
 
             PublishInternalMap(stamp);
             m_latest_map_msg_ = nullptr;
+            updated = true;
         }
 
-        // 2. Load external frontiers (grid_map_info is now up-to-date)
-        if (m_latest_frontier_msg_) {
+        // 2. Load external frontiers if a new one arrived (requires map to be initialized)
+        if (m_latest_frontier_msg_ && m_map_initialized_) {
             const auto &msg = m_latest_frontier_msg_;
             const auto grid_map_info = this->m_agent_->GetLogOddMap()->GetGridMapInfo();
             const int width = grid_map_info->Shape(0);
@@ -372,9 +371,11 @@ public:
                 "Loaded %zu frontiers from external source.",
                 frontiers.size());
             m_latest_frontier_msg_ = nullptr;
+            updated = true;
         }
 
-        // 3. Step the agent
+        // 3. Step the agent if anything was updated
+        if (!updated) { return; }
         this->Step(cur_pose, {} /* observation */, false /* step_agent */);
     }
 
